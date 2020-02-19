@@ -38,7 +38,7 @@ def artifact_downloader_parser():
                         help='The listt of tests to look at. e.g. mochitest-browser-chrome-e10s-2.' +
                         ' If it`s empty we assume that it means nothing, if `all` is given all suites' +
                         ' will be processed.')
-    parser.add_argument('--artifact-to-get', type=str, nargs=1, default='grcov',
+    parser.add_argument('--artifact-to-get', type=str, nargs='+', default=['grcov'],
                         help='Pattern matcher for the artifact you want to download. By default, it' +
                         ' is set to `grcov` to get ccov artifacts. Use `per_test_coverage` to get data' +
                         ' from test-coverage tasks.')
@@ -58,13 +58,17 @@ def artifact_downloader_parser():
 
 # Used to limit the number of concurrent data requests
 START_TIME = time.time()
-MAX_REQUESTS = 20
+MAX_REQUESTS = 5
 CURR_REQS = 0
 RETRY = 5
 TOTAL_TASKS = 0
 CURR_TASK = 0
 FAILED = []
 ALL_TASKS = []
+TC_PREFIX = 'https://firefox-ci-tc.services.mozilla.com/api/queue/'
+
+SECONDARYMETHOD = False
+TC_PREFIX2 = 'https://firefoxci.taskcluster-artifacts.net/'
 
 
 def log(msg):
@@ -97,22 +101,22 @@ def get_json(url, params=None):
 
 
 def get_task_details(task_id):
-    task_details = get_json('https://queue.taskcluster.net/v1/task/' + task_id)
+    task_details = get_json(TC_PREFIX + 'v1/task/' + task_id)
     return task_details
 
 
 def get_task_artifacts(task_id):
-    artifacts = get_json('https://queue.taskcluster.net/v1/task/' + task_id + '/artifacts')
+    artifacts = get_json(TC_PREFIX + 'v1/task/' + task_id + '/artifacts')
     return artifacts['artifacts']
 
 
 def get_tasks_in_group(group_id):
-    reply = get_json('https://queue.taskcluster.net/v1/task-group/' + group_id + '/list', {
+    reply = get_json(TC_PREFIX + 'v1/task-group/' + group_id + '/list', {
         'limit': '200',
     })
     tasks = reply['tasks']
     while 'continuationToken' in reply:
-        reply = get_json('https://queue.taskcluster.net/v1/task-group/' + group_id + '/list', {
+        reply = get_json(TC_PREFIX + 'v1/task-group/' + group_id + '/list', {
             'limit': '200',
             'continuationToken': reply['continuationToken'],
         })
@@ -130,7 +134,11 @@ def download_artifact(task_id, artifact, output_dir):
         return fname
 
     tries = 0
-    url_data = 'https://queue.taskcluster.net/v1/task/' + task_id + '/artifacts/' + artifact['name']
+    if not SECONDARYMETHOD:
+        url_data = TC_PREFIX + 'v1/task/' + task_id + '/artifacts/' + artifact['name']
+    else:
+        url_data = TC_PREFIX2 + task_id + '/0/' + artifact['name']
+
     while tries < RETRY:
         try:
             # Make the actual request
@@ -176,14 +184,24 @@ def make_count_dir(a_path):
     os.makedirs(a_path, exist_ok=True)
     return a_path
 
+def extract_tgz(tar_url, extract_path='.'):
+    import tarfile
+    tar = tarfile.open(tar_url, 'r')
+    for item in tar:
+        tar.extract(item, extract_path)
+        if item.name.find(".tgz") != -1 or item.name.find(".tar") != -1:
+            extract(item.name, "./" + item.name[:item.name.rfind('/')])
 
 def unzip_file(abs_zip_path, output_dir, count=0):
     tmp_path = ''
-    with zipfile.ZipFile(abs_zip_path, "r") as z:
-        tmp_path = os.path.join(output_dir, str(count))
-        if not os.path.exists(tmp_path):
-            make_count_dir(tmp_path)
-        z.extractall(tmp_path)
+    tmp_path = os.path.join(output_dir, str(count))
+    if not os.path.exists(tmp_path):
+        make_count_dir(tmp_path)
+    if abs_zip_path.endswith('.zip'):
+        with zipfile.ZipFile(abs_zip_path, "r") as z:
+            z.extractall(tmp_path)
+    else:
+        extract_tgz(abs_zip_path, tmp_path)
     return tmp_path
 
 
@@ -220,6 +238,9 @@ def artifact_downloader(
     if 'all' in test_suites:
         all_tasks = True
 
+    # For compatibility
+    if type(artifact_to_get) not in (list,):
+        artifact_to_get = [artifact_to_get]
 
     # Make the data directories
     task_dir = os.path.join(output_dir, task_group_id)
@@ -240,15 +261,28 @@ def artifact_downloader(
                 max_num = run_num
         os.chdir(curr_dir)
 
-    if not ingest_continue and max_num:
+    if not ingest_continue:
         run_number = max_num + 1
 
-    output_dir = os.path.join(output_dir, task_dir, str(run_number))
+    output_dir = os.path.join(task_dir, str(run_number))
     os.makedirs(output_dir, exist_ok=True)
+
+    log("Artifacts will be stored in %s" % output_dir)
+    config_json_path = os.path.join(output_dir, 'config.json')
+    with open(config_json_path, 'w') as f:
+        json.dump({
+            'test_suites': test_suites,
+            'platform': platform,
+            'artifact': artifact_to_get,
+            'download_failures': download_failures,
+            'task_group_id': task_group_id
+        }, f, indent=4)
+
+    log("Saved run configuration to %s" % config_json_path)
 
     task_ids = []
     log("Getting task group information...")
-    tgi_path = os.path.join(output_dir, 'task-group-information.json')
+    tgi_path = os.path.join(task_dir, 'task-group-information.json')
     if os.path.exists(tgi_path):
         with open(tgi_path, 'r') as f:
             tasks = json.load(f)
@@ -284,16 +318,23 @@ def artifact_downloader(
             download_this_task = True
 
         if all_tasks or download_this_task:
+            if 'GECKO_HEAD_REV' in task['task']['payload']['env']:
+                # Some tasks are missing this variable
+                head_rev = task['task']['payload']['env']['GECKO_HEAD_REV']
+            
             # Make directories for this task
-            head_rev = task['task']['payload']['env']['GECKO_HEAD_REV']
             grcov_dir = os.path.join(output_dir, test_name)
             downloads_dir = os.path.join(os.path.join(grcov_dir, 'downloads'))
-            data_dir = os.path.join(os.path.join(grcov_dir, (artifact_to_get.replace(".", "")) + '_data'))
+            data_dir = {
+                aname: os.path.join(os.path.join(grcov_dir, (aname.replace(".", "")) + '_data'))
+                for aname in artifact_to_get
+            }
 
             if test_name not in task_counters:
                 os.makedirs(grcov_dir, exist_ok=True)
                 os.makedirs(downloads_dir, exist_ok=True)
-                os.makedirs(data_dir, exist_ok=True)
+                for _, p in data_dir.items():
+                    os.makedirs(p, exist_ok=True)
                 task_counters[test_name] = 0
             else:
                 task_counters[test_name] += 1
@@ -305,26 +346,48 @@ def artifact_downloader(
                              download_failures, taskid_to_file_map):
                 global CURR_REQS
 
+                def _pattern_match(name, artifacts_to_get):
+                    for aname in artifacts_to_get:
+                        if aname in name:
+                            return aname
+                    return None
+
                 files = os.listdir(downloads_dir)
-                ffound = [f for f in files if artifact_to_get in f and task_id in f]
+                ffound = [f for f in files if _pattern_match(f, artifact_to_get) and task_id in f]
                 if ffound:
-                    log('File already exists.')  
+                    log('File already exists.')
                     CURR_REQS -= 1
 
-                    if artifact_to_get == 'grcov' or unzip_artifact:
+                    # There should only be file found
+                    filen = ffound[0]
+                    aname = _pattern_match(filen, artifact_to_get)
+
+                    if aname == 'grcov' or 'grcov' in aname or unzip_artifact:
                         unzip_file(filen, data_dir, test_counter)
                     else:
                         move_file(filen, data_dir, test_counter)
+
                     taskid_to_file_map[task_id] = os.path.join(
                         data_dir, str(test_counter)
                     )
 
-                    return fname
+                    return filen
 
                 CURR_REQS += 1
                 log("Getting task artifacts for %s" % task_id)
                 artifacts = get_task_artifacts(task_id)
                 CURR_REQS -= 1
+
+                # Check if the artifact to get exists before checking for
+                # failures in the task
+                exists = False
+                for artifact in artifacts:
+                    if _pattern_match(artifact['name'], artifact_to_get):
+                        exists = True
+                if not exists:
+                    log("Missing %s in %s" % (artifact_to_get, task_id))
+                    CURR_REQS -= 1
+                    return
 
                 if not download_failures:
                     log("Checking for failures on %s" % task_id)
@@ -341,20 +404,22 @@ def artifact_downloader(
                         return
 
                 for artifact in artifacts:
-                    if artifact_to_get in artifact['name']:
+                    aname = _pattern_match(artifact['name'], artifact_to_get)
+                    if aname:
                         filen = download_artifact(task_id, artifact, downloads_dir)
                         CURR_REQS -= 1
 
-                        if artifact_to_get == 'grcov' or unzip_artifact:
-                            unzip_file(filen, data_dir, test_counter)
+                        if aname == 'grcov' or unzip_artifact:
+                            unzip_file(filen, data_dir[aname], test_counter)
                         else:
-                            move_file(filen, data_dir, test_counter)
+                            move_file(filen, data_dir[aname], test_counter)
                         taskid_to_file_map[task_id] = os.path.join(
-                            data_dir, str(test_counter)
+                            data_dir[aname], str(test_counter)
                         )
                         log("Finished %s for %s" % (task_id, test_name))
 
             CURR_REQS += 1
+            log(artifact_to_get)
             t = threading.Thread(
                 target=get_artifacts,
                 args=(
@@ -373,6 +438,7 @@ def artifact_downloader(
                 log(
                     "Waiting for requests to finish, currently at %s" % str(CURR_REQS)
                 )
+
         CURR_TASK += 1
 
     for t in threads:
@@ -401,7 +467,7 @@ def main():
 
     task_group_id = args.task_group_id[0]
     test_suites = args.test_suites_list
-    artifact_to_get = args.artifact_to_get[0]
+    artifact_to_get = args.artifact_to_get
     unzip_artifact = args.unzip_artifact
     platform = args.platform
     download_failures = args.download_failures
